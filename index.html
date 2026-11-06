@@ -945,6 +945,16 @@ function KPIApp() {
     setDepartments((prev) => [...prev, dept]);
     return dept;
   };
+  // Lets admin correct a department's name/color without archiving and recreating it — added 2026-11
+  // after a client got stuck trying to move an employee into a "new" department because the real
+  // fix (editing the department directly, or editing the employee's deptId below) didn't exist yet.
+  const updateDepartment = (deptId, patch) => {
+    setDepartments((prev) => prev.map((d) => d.id === deptId ? { ...d, ...patch } : d));
+    const dbPatch = {};
+    if (patch.name !== undefined) dbPatch.name = patch.name;
+    if (patch.colorHex !== undefined) dbPatch.color_hex = patch.colorHex;
+    if (Object.keys(dbPatch).length) supabaseClient.from("departments").update(dbPatch).eq("id", deptId).then(({ error }) => { if (error) console.error("Failed to update department:", error); });
+  };
   const archiveDepartment = (deptId) => {
     setDepartments((prev) => prev.map((d) => d.id === deptId ? { ...d, active: false } : d));
     supabaseClient.from("departments").update({ active: false }).eq("id", deptId).then(({ error }) => { if (error) console.error("Failed to archive department:", error); });
@@ -1302,7 +1312,7 @@ function KPIApp() {
     companies, addCompany, updateCompany, archiveCompany, restoreCompany, openCompanyProof,
     employees, departments, deptById, goals, getRecord, toggleTask, adminUntick, submitTaskWithDetails, setApproval, setRemark, setAdminRemark, setAttachment,
     isGoalLocked, isReviewLocked, employeeGoals, employeePoints, addGoal, updateGoal, archiveGoal, restoreGoal, addTaskToGoal, updateTaskRequiresAttachment, updateTaskRequiresRemark, updateTaskText,
-    removeTaskFromGoal, updateTaskWeight, toggleAssignment, addEmployee, updateEmployee, archiveEmployee, restoreEmployee, resetEmployeePassword, addDepartment, archiveDepartment, restoreDepartment, checkins, addCheckin,
+    removeTaskFromGoal, updateTaskWeight, toggleAssignment, addEmployee, updateEmployee, archiveEmployee, restoreEmployee, resetEmployeePassword, addDepartment, updateDepartment, archiveDepartment, restoreDepartment, checkins, addCheckin,
     notify,
     rewardSchemes, addRewardScheme, archiveRewardScheme, restoreRewardScheme, toggleRewardActive, toggleRewardEnrollment, updateRewardEmployeeOverride, commitRewardSchemeEdit, goalCompletionForEmployee,
     getMonthView, commitCurrentMonthEdit, scheduleFutureVersion, employeeAnnualPoints,
@@ -2753,13 +2763,14 @@ function AdminOverview({ companies, departments, employees, employeePoints }) {
   );
 }
 
-function AdminPeople({ departments, employees, addEmployee, archiveEmployee, restoreEmployee, resetEmployeePassword, addDepartment, archiveDepartment, restoreDepartment, activeCompanyId, switchCompany, companies, activeDeptId, setActiveDeptId, goals, getRecord, employeePoints, notify }) {
+function AdminPeople({ departments, employees, addEmployee, updateEmployee, archiveEmployee, restoreEmployee, resetEmployeePassword, addDepartment, updateDepartment, archiveDepartment, restoreDepartment, activeCompanyId, switchCompany, companies, activeDeptId, setActiveDeptId, goals, getRecord, employeePoints, notify }) {
   const [selectedEmpId, setSelectedEmpId] = useState(null);
   const [resetPwEmp, setResetPwEmp] = useState(null);
   const [showAddEmployee, setShowAddEmployee] = useState(false);
   const [showAddDept, setShowAddDept] = useState(false);
   const [showManageDept, setShowManageDept] = useState(false);
   const [showArchived, setShowArchived] = useState(false);
+  const [editingEmpId, setEditingEmpId] = useState(null);
   const deptsInCompany = departments.filter((d) => d.companyId === activeCompanyId && d.active !== false);
   const deptEmployees = employees.filter((e) => e.deptId === activeDeptId && (showArchived || e.active !== false));
   const totalActiveEmployees = employees.filter((e) => e.active !== false).length;
@@ -2803,6 +2814,7 @@ function AdminPeople({ departments, employees, addEmployee, archiveEmployee, res
         <ManageDepartmentsModal
           departments={departments.filter((d) => d.companyId === activeCompanyId)}
           activeDeptId={activeDeptId} setActiveDeptId={setActiveDeptId}
+          updateDepartment={updateDepartment}
           archiveDepartment={archiveDepartment} restoreDepartment={restoreDepartment}
           notify={notify} onClose={() => setShowManageDept(false)}
         />
@@ -2814,23 +2826,31 @@ function AdminPeople({ departments, employees, addEmployee, archiveEmployee, res
           const empGoals = assignedGoalsFor(e.id);
           const pct = employeePoints(e.id).percentage;
           return (
-            <div key={e.id} className={`w-full px-4 py-3 flex items-center justify-between hover:bg-slate-50 transition-colors ${e.active === false ? "opacity-50" : ""}`}>
-              <button onClick={() => setSelectedEmpId(e.id)} className="text-left flex-1 min-w-0">
-                <p className="text-sm font-medium text-teal-700 hover:underline">{e.name}{e.active === false && <span className="ml-2 text-[11px] font-normal text-slate-400">(archived)</span>}</p>
-                <p className="text-xs text-slate-400">{e.email} · {e.role === "ceo" ? "Admin" : "Staff"} · {empGoals.length ? empGoals.map((g) => g.name).join(", ") : "No goals assigned yet"}</p>
-              </button>
-              <div className="flex items-center gap-3 shrink-0 ml-3">
-                <PercentBar value={pct} width={80} />
-                {e.active !== false && (
-                  <button onClick={() => setResetPwEmp(e)} title="Reset password" className="p-1.5 rounded-md text-slate-400 hover:bg-slate-100 hover:text-slate-600"><Key size={14} /></button>
-                )}
-                {e.active === false ? (
-                  <button onClick={() => { restoreEmployee(e.id); notify(`Restored ${e.name}`); }} title="Restore" className="p-1.5 rounded-md text-emerald-600 hover:bg-emerald-50"><Undo2 size={14} /></button>
-                ) : (
-                  <button onClick={() => { archiveEmployee(e.id); notify(`Archived ${e.name}`); }} title="Archive" className="p-1.5 rounded-md text-slate-300 hover:bg-rose-50 hover:text-rose-500"><Trash2 size={14} /></button>
-                )}
+            <React.Fragment key={e.id}>
+              <div className={`w-full px-4 py-3 flex items-center justify-between hover:bg-slate-50 transition-colors ${e.active === false ? "opacity-50" : ""}`}>
+                <button onClick={() => setSelectedEmpId(e.id)} className="text-left flex-1 min-w-0">
+                  <p className="text-sm font-medium text-teal-700 hover:underline">{e.name}{e.active === false && <span className="ml-2 text-[11px] font-normal text-slate-400">(archived)</span>}</p>
+                  <p className="text-xs text-slate-400">{e.email} · {e.role === "ceo" ? "Admin" : "Staff"} · {empGoals.length ? empGoals.map((g) => g.name).join(", ") : "No goals assigned yet"}</p>
+                </button>
+                <div className="flex items-center gap-3 shrink-0 ml-3">
+                  <PercentBar value={pct} width={80} />
+                  <button onClick={() => setEditingEmpId((id) => id === e.id ? null : e.id)} title="Edit" className="p-1.5 rounded-md text-slate-400 hover:bg-slate-100 hover:text-slate-600"><Pencil size={14} /></button>
+                  {e.active !== false && (
+                    <button onClick={() => setResetPwEmp(e)} title="Reset password" className="p-1.5 rounded-md text-slate-400 hover:bg-slate-100 hover:text-slate-600"><Key size={14} /></button>
+                  )}
+                  {e.active === false ? (
+                    <button onClick={() => { restoreEmployee(e.id); notify(`Restored ${e.name}`); }} title="Restore" className="p-1.5 rounded-md text-emerald-600 hover:bg-emerald-50"><Undo2 size={14} /></button>
+                  ) : (
+                    <button onClick={() => { archiveEmployee(e.id); notify(`Archived ${e.name}`); }} title="Archive" className="p-1.5 rounded-md text-slate-300 hover:bg-rose-50 hover:text-rose-500"><Trash2 size={14} /></button>
+                  )}
+                </div>
               </div>
-            </div>
+              {editingEmpId === e.id && (
+                <div className="px-4 pb-4 bg-slate-50">
+                  <EditEmployeeForm emp={e} departments={departments} companies={companies} updateEmployee={updateEmployee} notify={notify} onDone={() => setEditingEmpId(null)} />
+                </div>
+              )}
+            </React.Fragment>
           );
         })}
       </div>
@@ -2986,9 +3006,20 @@ function deptStylesheet(departments) {
   }).join("\n");
 }
 
-function ManageDepartmentsModal({ departments, activeDeptId, setActiveDeptId, archiveDepartment, restoreDepartment, notify, onClose }) {
+function ManageDepartmentsModal({ departments, activeDeptId, setActiveDeptId, updateDepartment, archiveDepartment, restoreDepartment, notify, onClose }) {
   const active = departments.filter((d) => d.active !== false);
   const archived = departments.filter((d) => d.active === false);
+  const [editingId, setEditingId] = useState(null);
+  const [editName, setEditName] = useState("");
+  const [editHex, setEditHex] = useState("#14b8a6");
+
+  const startEdit = (d) => { setEditingId(d.id); setEditName(d.name); setEditHex(d.colorHex || "#14b8a6"); };
+  const saveEdit = (deptId) => {
+    if (!editName.trim()) return;
+    updateDepartment(deptId, { name: editName.trim(), colorHex: editHex });
+    notify("Department updated");
+    setEditingId(null);
+  };
 
   return (
     <div className="fixed inset-0 bg-slate-900/40 flex items-center justify-center z-30 p-6" onClick={onClose}>
@@ -3001,12 +3032,26 @@ function ManageDepartmentsModal({ departments, activeDeptId, setActiveDeptId, ar
         <p className="text-xs uppercase tracking-wide text-slate-400 font-medium mb-2">Active</p>
         <div className="space-y-1.5 mb-4">
           {active.map((d) => (
-            <div key={d.id} className="flex items-center justify-between bg-slate-50 rounded-lg px-3 py-2">
-              <span className="text-sm text-slate-700">{d.name}</span>
-              <button
-                onClick={() => { archiveDepartment(d.id); notify(`Archived department "${d.name}"`); if (activeDeptId === d.id) setActiveDeptId(active.find((x) => x.id !== d.id)?.id); }}
-                title="Archive" className="p-1 rounded-md text-slate-400 hover:bg-rose-50 hover:text-rose-500"
-              ><Trash2 size={14} /></button>
+            <div key={d.id} className="bg-slate-50 rounded-lg px-3 py-2">
+              {editingId === d.id ? (
+                <div className="flex items-center gap-2">
+                  <input type="color" value={editHex} onChange={(e) => setEditHex(e.target.value)} className="w-7 h-7 rounded border border-slate-200 cursor-pointer p-0 bg-transparent" />
+                  <input value={editName} onChange={(e) => setEditName(e.target.value)} className="flex-1 min-w-0 px-2 py-1 rounded-md border border-slate-200 text-sm" autoFocus />
+                  <button onClick={() => saveEdit(d.id)} className="text-xs font-medium text-emerald-600 hover:underline shrink-0">Save</button>
+                  <button onClick={() => setEditingId(null)} className="text-xs font-medium text-slate-400 hover:underline shrink-0">Cancel</button>
+                </div>
+              ) : (
+                <div className="flex items-center justify-between">
+                  <span className="text-sm text-slate-700">{d.name}</span>
+                  <div className="flex items-center gap-1">
+                    <button onClick={() => startEdit(d)} title="Edit" className="p-1 rounded-md text-slate-400 hover:bg-slate-100 hover:text-slate-600"><Pencil size={14} /></button>
+                    <button
+                      onClick={() => { archiveDepartment(d.id); notify(`Archived department "${d.name}"`); if (activeDeptId === d.id) setActiveDeptId(active.find((x) => x.id !== d.id)?.id); }}
+                      title="Archive" className="p-1 rounded-md text-slate-400 hover:bg-rose-50 hover:text-rose-500"
+                    ><Trash2 size={14} /></button>
+                  </div>
+                </div>
+              )}
             </div>
           ))}
           {active.length === 0 && <p className="text-xs text-slate-400">No active departments.</p>}
@@ -3124,6 +3169,70 @@ function AddEmployeeForm({ departments, companies, activeCompanyId, activeDeptId
       </div>
       <div className="flex gap-2">
         <button onClick={submit} disabled={saving} className="px-4 py-2 rounded-lg bg-slate-900 text-white text-sm font-medium disabled:opacity-50">{saving ? "Creating…" : "Create account"}</button>
+        <button onClick={onDone} className="px-4 py-2 rounded-lg border border-slate-200 text-slate-600 text-sm font-medium">Cancel</button>
+      </div>
+    </div>
+  );
+}
+
+// Added 2026-11 so a mistake (wrong name, wrong department) can be corrected directly instead of
+// archiving the employee and re-adding them — the delete-and-re-add path is what left a client
+// stuck with an email collision, since archiving never frees it (and shouldn't — see archiveEmployee
+// above; Scorecard never hard-deletes). Email itself stays read-only here: changing it would also
+// need to update the matching Supabase Auth login, which this form doesn't touch.
+function EditEmployeeForm({ emp, departments, companies, updateEmployee, notify, onDone }) {
+  const [name, setName] = useState(emp.name);
+  const [role, setRole] = useState(emp.role);
+  const currentDept = departments.find((d) => d.id === emp.deptId);
+  const [companyId, setCompanyId] = useState(currentDept?.companyId || "");
+  const deptsInThisCompany = departments.filter((d) => d.companyId === companyId && d.active !== false);
+  const [deptId, setDeptId] = useState(emp.deptId);
+
+  const changeCompany = (newCompanyId) => {
+    setCompanyId(newCompanyId);
+    const firstDept = departments.find((d) => d.companyId === newCompanyId && d.active !== false);
+    setDeptId(firstDept?.id || "");
+  };
+
+  const save = () => {
+    if (!name.trim() || !deptId) return;
+    updateEmployee(emp.id, { name: name.trim(), role, deptId });
+    notify(`Updated ${name.trim()}`);
+    onDone();
+  };
+
+  return (
+    <div className="bg-white rounded-xl border-2 border-dashed border-slate-200 p-4">
+      <p className="text-sm font-semibold mb-3">Edit employee</p>
+      <div className="mb-2">
+        <label className="text-[11px] text-slate-400">Full name</label>
+        <input value={name} onChange={(e) => setName(e.target.value)} className="w-full px-3 py-2 rounded-lg border border-slate-200 text-sm" />
+      </div>
+      <p className="text-[11px] text-slate-400 mb-2">{emp.email} — email can't be changed here; archive and re-add if it's genuinely wrong.</p>
+      <div className="grid grid-cols-2 gap-2 mb-2">
+        <div>
+          <label className="text-[11px] text-slate-400">Access rights</label>
+          <select value={role} onChange={(e) => setRole(e.target.value)} className="w-full px-3 py-2 rounded-lg border border-slate-200 text-sm">
+            <option value="staff">Staff</option>
+            <option value="ceo">Admin</option>
+          </select>
+        </div>
+        <div>
+          <label className="text-[11px] text-slate-400">Company</label>
+          <select value={companyId} onChange={(e) => changeCompany(e.target.value)} className="w-full px-3 py-2 rounded-lg border border-slate-200 text-sm">
+            {companies.filter((c) => c.active !== false).map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
+          </select>
+        </div>
+      </div>
+      <div className="mb-3">
+        <label className="text-[11px] text-slate-400">Department — each person works in exactly one company and one department</label>
+        <select value={deptId} onChange={(e) => setDeptId(e.target.value)} className="w-full px-3 py-2 rounded-lg border border-slate-200 text-sm">
+          {deptsInThisCompany.length === 0 && <option value="">No departments in this company yet</option>}
+          {deptsInThisCompany.map((d) => <option key={d.id} value={d.id}>{d.name}</option>)}
+        </select>
+      </div>
+      <div className="flex gap-2">
+        <button onClick={save} className="px-4 py-2 rounded-lg bg-slate-900 text-white text-sm font-medium">Save</button>
         <button onClick={onDone} className="px-4 py-2 rounded-lg border border-slate-200 text-slate-600 text-sm font-medium">Cancel</button>
       </div>
     </div>
