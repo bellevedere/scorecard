@@ -281,7 +281,7 @@ function KPIApp() {
         supabaseClient.from("goal_future_versions").select("*"),
         supabaseClient.from("check_ins").select("*").order("timestamp", { ascending: false }),
         supabaseClient.from("reward_schemes").select("*"),
-        supabaseClient.from("reward_enrollments").select("*"),
+        supabaseClient.from("reward_payouts").select("*"),
       ]);
       if (!active) return;
       if (companiesRes.error) console.error("Failed to load companies:", companiesRes.error);
@@ -295,7 +295,7 @@ function KPIApp() {
       if (futureRes.error) console.error("Failed to load goal future versions:", futureRes.error);
       if (checkinsRes.error) console.error("Failed to load check-ins:", checkinsRes.error);
       if (rewardSchemesRes.error) console.error("Failed to load reward schemes:", rewardSchemesRes.error);
-      if (rewardEnrollmentsRes.error) console.error("Failed to load reward enrollments:", rewardEnrollmentsRes.error);
+      if (rewardEnrollmentsRes.error) console.error("Failed to load reward payouts:", rewardEnrollmentsRes.error);
 
       setCompanies((companiesRes.data || []).map((c) => ({
         id: c.id, name: c.name, description: c.description || "", active: c.active !== false,
@@ -378,21 +378,20 @@ function KPIApp() {
         withinWindow: c.within_window, address: c.address || null,
       })));
 
-      // reward_enrollments has no "enrolled" boolean of its own — a row's mere presence for
-      // (scheme_id, employee_id) IS the enrollment, and that same row carries the per-employee
-      // override amount/remark. So both enrolledEmployeeIds and employeeOverrides for a scheme
-      // are just two views of the same set of rows, grouped here by scheme_id.
-      const enrollByScheme = {};
+      // Each scheme covers one or more departments (dept_ids) and holds its per-month rewards
+      // (reward_payouts: one row per person per month — ticked flag, amount, remark, last-updated).
+      const payoutsByScheme = {};
       (rewardEnrollmentsRes.data || []).forEach((r) => {
-        const bucket = enrollByScheme[r.scheme_id] || (enrollByScheme[r.scheme_id] = { ids: [], overrides: {} });
-        bucket.ids.push(r.employee_id);
-        bucket.overrides[r.employee_id] = { updateAmount: Number(r.update_amount), remark: r.remark || "" };
+        (payoutsByScheme[r.scheme_id] || (payoutsByScheme[r.scheme_id] = [])).push({
+          id: r.id, employeeId: r.employee_id, month: r.month, eligible: r.eligible !== false,
+          amount: Number(r.amount) || 0, remark: r.remark || "", updatedAt: r.updated_at || null,
+        });
       });
       setRewardSchemes((rewardSchemesRes.data || []).map((s) => ({
-        id: s.id, deptId: s.dept_id, companyId: s.company_id, goalId: s.goal_id,
+        id: s.id, name: s.name || "", deptId: s.dept_id, deptIds: (s.dept_ids && s.dept_ids.length) ? s.dept_ids : [s.dept_id],
+        companyId: s.company_id, goalId: s.goal_id,
         startDate: s.start_date, endDate: s.end_date, baseAmount: Number(s.base_amount), active: s.active, deleted: s.deleted === true,
-        enrolledEmployeeIds: enrollByScheme[s.id]?.ids || [],
-        employeeOverrides: enrollByScheme[s.id]?.overrides || {},
+        payouts: payoutsByScheme[s.id] || [],
         futureBaseAmount: s.future_base_amount != null ? Number(s.future_base_amount) : null,
         futureEffectiveMonth: s.future_effective_month || null,
       })));
@@ -841,22 +840,44 @@ function KPIApp() {
   };
 
   // Schedule (or update) a future month's version without touching anything live. No modal/warning needed.
-  const scheduleFutureVersion = (goalId, isoMonth, newTasks, newAssignedEmployeeIds) => {
+  // scope: "future" (default) = this month and every month after; "month" = this month only (a revert is scheduled for the following month).
+  const scheduleFutureVersion = (goalId, isoMonth, newTasks, newAssignedEmployeeIds, scope = "future") => {
     const goal = goals.find((g) => g.id === goalId);
+    const snap = (tasks) => tasks.map((t) => ({ text: t.text, weight: t.weight, description: t.description || "", requiresAttachment: t.requiresAttachment, requiresRemark: t.requiresRemark }));
+    // For "this month only", work out what the NEXT month would have been before this edit, so we can restore it.
+    let revert = null;
+    if (scope === "month" && goal) {
+      const nxt = nextIsoMonth(isoMonth);
+      const lastMonth = isoMonthOf(goal.endDate);
+      const alreadyExplicit = goal.futureVersions.some((v) => v.effectiveFromMonth === nxt);
+      if (!alreadyExplicit && (!lastMonth || nxt <= lastMonth)) {
+        const prevView = getMonthView(goal, nxt);
+        revert = { effectiveFromMonth: nxt, tasks: prevView.tasks, assignedEmployeeIds: prevView.assignedEmployeeIds };
+      }
+    }
     setGoals((prev) => prev.map((g) => {
       if (g.id !== goalId) return g;
-      const existingIdx = g.futureVersions.findIndex((v) => v.effectiveFromMonth === isoMonth);
-      const entry = { effectiveFromMonth: isoMonth, tasks: newTasks, assignedEmployeeIds: newAssignedEmployeeIds };
-      const futureVersions = existingIdx >= 0 ? g.futureVersions.map((v, i) => i === existingIdx ? entry : v) : [...g.futureVersions, entry];
+      const upsertEntry = (list, entry) => {
+        const i = list.findIndex((v) => v.effectiveFromMonth === entry.effectiveFromMonth);
+        return i >= 0 ? list.map((v, k) => k === i ? entry : v) : [...list, entry];
+      };
+      let futureVersions = upsertEntry(g.futureVersions, { effectiveFromMonth: isoMonth, tasks: newTasks, assignedEmployeeIds: newAssignedEmployeeIds });
+      if (revert) futureVersions = upsertEntry(futureVersions, revert);
       return { ...g, futureVersions };
     }));
+    if (revert) {
+      supabaseClient.from("goal_future_versions").upsert({
+        goal_id: goalId, effective_from_month: revert.effectiveFromMonth,
+        tasks_snapshot: snap(revert.tasks), assigned_snapshot: revert.assignedEmployeeIds,
+      }, { onConflict: "goal_id,effective_from_month" }).then(({ error }) => { if (error) console.error("Failed to schedule revert:", error); });
+    }
     supabaseClient.from("goal_future_versions").upsert({
       goal_id: goalId, effective_from_month: isoMonth,
       tasks_snapshot: newTasks.map((t) => ({ text: t.text, weight: t.weight, description: t.description || "", requiresAttachment: t.requiresAttachment, requiresRemark: t.requiresRemark })),
       assigned_snapshot: newAssignedEmployeeIds,
     }, { onConflict: "goal_id,effective_from_month" }).then(({ error }) => { if (error) console.error("Failed to schedule change:", error); });
     if (goal) newAssignedEmployeeIds.forEach((empId) => addNotification(empId, `"${goal.name}" has scheduled changes for ${monthLabel(isoMonth)}.`, false));
-    notify(`Scheduled changes for ${monthLabel(isoMonth)}.`);
+    notify(scope === "month" ? `Scheduled changes for ${monthLabel(isoMonth)} only — reverts automatically the month after.` : `Scheduled changes for ${monthLabel(isoMonth)} and every month after, until changed again.`);
   };
 
   // Running total: sums awarded/assigned across every past month's frozen snapshot plus the live current month, for every annual goal the employee has ever been part of.
@@ -1154,21 +1175,27 @@ function KPIApp() {
   // ---- Reward schemes (preset, recurring — like a goal, but pays out based on goal performance) ----
   // Creates the scheme row in Supabase first (mirrors addGoal) so local state holds the real DB id from
   // the start — every later action here (enroll, override, edit) looks the scheme up by that id.
-  const addRewardScheme = async (deptId, companyId, goalId, startDate, endDate, baseAmount) => {
+  const addRewardScheme = async (deptIds, companyId, name, startDate, endDate, baseAmount) => {
     const { data: schemeRow, error } = await supabaseClient.from("reward_schemes").insert({
-      dept_id: deptId, company_id: companyId, goal_id: goalId,
+      dept_id: deptIds[0], dept_ids: deptIds, company_id: companyId, name: name || null, goal_id: null,
       start_date: startDate, end_date: endDate, base_amount: baseAmount, active: true,
     }).select().single();
-    if (error || !schemeRow) { console.error("Failed to create reward scheme:", error); return; }
+    if (error || !schemeRow) { console.error("Failed to create reward scheme:", error); notify("Couldn't create the reward scheme — please try again."); return; }
     const scheme = {
-      id: schemeRow.id, deptId, companyId, goalId, startDate, endDate,
-      baseAmount, active: true,
-      enrolledEmployeeIds: [],
-      employeeOverrides: {}, // empId -> { updateAmount, remark }
-      futureBaseAmount: null, futureEffectiveMonth: null, // scheduled change, "future" scope
+      id: schemeRow.id, name: name || "", deptId: deptIds[0], deptIds, companyId, goalId: null, startDate, endDate,
+      baseAmount, active: true, deleted: false, payouts: [],
+      futureBaseAmount: null, futureEffectiveMonth: null,
     };
     setRewardSchemes((prev) => [...prev, scheme]);
     return scheme;
+  };
+  const updateRewardSchemeDepts = (schemeId, deptIds) => {
+    setRewardSchemes((prev) => prev.map((s) => s.id === schemeId ? { ...s, deptIds, deptId: deptIds[0] } : s));
+    supabaseClient.from("reward_schemes").update({ dept_ids: deptIds, dept_id: deptIds[0] }).eq("id", schemeId).then(({ error }) => { if (error) { console.error("Failed to update reward departments:", error); notify("Couldn't save the departments — please try again."); } });
+  };
+  const updateRewardSchemeName = (schemeId, name) => {
+    setRewardSchemes((prev) => prev.map((s) => s.id === schemeId ? { ...s, name } : s));
+    supabaseClient.from("reward_schemes").update({ name: name || null }).eq("id", schemeId).then(({ error }) => { if (error) console.error("Failed to rename reward scheme:", error); });
   };
   const archiveRewardScheme = (schemeId) => {
     setRewardSchemes((prev) => prev.map((s) => s.id === schemeId ? { ...s, active: false } : s));
@@ -1202,50 +1229,29 @@ function KPIApp() {
     supabaseClient.from("reward_schemes").update({ active: nextActive }).eq("id", schemeId).then(({ error }) => { if (error) console.error("Failed to toggle reward scheme:", error); });
   };
 
-  // reward_enrollments has no separate "enrolled" flag — a row existing for (scheme_id, employee_id) IS
-  // the enrollment, and that same row holds the override amount/remark. So enrolling inserts a row
-  // (seeded with the scheme's current base amount) and un-enrolling deletes it outright.
-  const toggleRewardEnrollment = (schemeId, empId) => {
+  // One reward = one row per (scheme, person, month). Ticking creates/re-activates it (seeded with the scheme's
+  // base amount); un-ticking keeps the row (eligible=false) so the history is never lost. patch may hold
+  // any of: eligible, amount, remark.
+  const setRewardPayout = (schemeId, empId, month, patch) => {
     const scheme = rewardSchemes.find((s) => s.id === schemeId);
     if (!scheme) return;
-    const has = scheme.enrolledEmployeeIds.includes(empId);
+    const existing = scheme.payouts.find((p) => p.employeeId === empId && p.month === month);
+    const next = {
+      eligible: existing ? existing.eligible : false,
+      amount: existing ? existing.amount : scheme.baseAmount,
+      remark: existing ? existing.remark : "",
+      ...patch,
+    };
+    const updatedAt = new Date().toISOString();
     setRewardSchemes((prev) => prev.map((s) => {
       if (s.id !== schemeId) return s;
-      if (has) {
-        const nextOverrides = { ...s.employeeOverrides };
-        delete nextOverrides[empId];
-        return { ...s, enrolledEmployeeIds: s.enrolledEmployeeIds.filter((id) => id !== empId), employeeOverrides: nextOverrides };
-      }
-      return { ...s, enrolledEmployeeIds: [...s.enrolledEmployeeIds, empId], employeeOverrides: { ...s.employeeOverrides, [empId]: { updateAmount: s.baseAmount, remark: "" } } };
+      const others = s.payouts.filter((p) => !(p.employeeId === empId && p.month === month));
+      return { ...s, payouts: [...others, { id: existing?.id, employeeId: empId, month, ...next, updatedAt }] };
     }));
-    if (has) {
-      supabaseClient.from("reward_enrollments").delete().eq("scheme_id", schemeId).eq("employee_id", empId)
-        .then(({ error }) => { if (error) console.error("Failed to unenroll from reward scheme:", error); });
-    } else {
-      supabaseClient.from("reward_enrollments").insert({ scheme_id: schemeId, employee_id: empId, update_amount: scheme.baseAmount, remark: "" })
-        .then(({ error }) => { if (error) console.error("Failed to enroll in reward scheme:", error); });
-    }
-  };
-
-  // Editing an override implicitly enrolls the employee too (same row-presence rule as above) — the
-  // admin UI lets you type an amount before ticking the enrollment checkbox, so this has to cover that.
-  const updateRewardEmployeeOverride = (schemeId, empId, patch) => {
-    const scheme = rewardSchemes.find((s) => s.id === schemeId);
-    if (!scheme) return;
-    const cur = scheme.employeeOverrides[empId] || { updateAmount: scheme.baseAmount, remark: "" };
-    const merged = { ...cur, ...patch };
-    const alreadyEnrolled = scheme.enrolledEmployeeIds.includes(empId);
-    setRewardSchemes((prev) => prev.map((s) => {
-      if (s.id !== schemeId) return s;
-      return {
-        ...s,
-        enrolledEmployeeIds: alreadyEnrolled ? s.enrolledEmployeeIds : [...s.enrolledEmployeeIds, empId],
-        employeeOverrides: { ...s.employeeOverrides, [empId]: merged },
-      };
-    }));
-    supabaseClient.from("reward_enrollments").upsert({
-      scheme_id: schemeId, employee_id: empId, update_amount: merged.updateAmount, remark: merged.remark,
-    }, { onConflict: "scheme_id,employee_id" }).then(({ error }) => { if (error) console.error("Failed to update reward override:", error); });
+    supabaseClient.from("reward_payouts").upsert({
+      scheme_id: schemeId, employee_id: empId, month, eligible: next.eligible, amount: next.amount, remark: next.remark,
+      updated_at: updatedAt, updated_by: session?.employeeId || null,
+    }, { onConflict: "scheme_id,employee_id,month" }).then(({ error }) => { if (error) { console.error("Failed to save reward:", error); notify("Couldn't save that reward — please try again."); } });
   };
 
   // Edit scope mirrors the goal-edit modal: "current" applies now but auto-reverts next month;
@@ -1376,7 +1382,7 @@ function KPIApp() {
     isGoalLocked, isReviewLocked, employeeGoals, employeePoints, addGoal, updateGoal, archiveGoal, restoreGoal, addTaskToGoal, updateTaskRequiresAttachment, updateTaskRequiresRemark, updateTaskText,
     removeTaskFromGoal, updateTaskWeight, toggleAssignment, addEmployee, updateEmployee, archiveEmployee, restoreEmployee, resetEmployeePassword, addDepartment, updateDepartment, archiveDepartment, restoreDepartment, checkins, addCheckin,
     notify,
-    rewardSchemes, addRewardScheme, updateRewardSchemePeriod, deleteRewardScheme, undeleteRewardScheme, archiveRewardScheme, restoreRewardScheme, toggleRewardActive, toggleRewardEnrollment, updateRewardEmployeeOverride, commitRewardSchemeEdit, goalCompletionForEmployee,
+    rewardSchemes, addRewardScheme, updateRewardSchemePeriod, updateRewardSchemeDepts, updateRewardSchemeName, deleteRewardScheme, undeleteRewardScheme, archiveRewardScheme, restoreRewardScheme, toggleRewardActive, setRewardPayout, commitRewardSchemeEdit, goalCompletionForEmployee,
     getMonthView, commitCurrentMonthEdit, scheduleFutureVersion, employeeAnnualPoints,
   };
 
@@ -3398,12 +3404,11 @@ function AnnualGoalEditorCard({ goal, deptEmployees, getMonthView, commitCurrent
   };
 
   const handleSave = () => {
-    if (isLive) { setShowScopeModal(true); return; }
-    scheduleFutureVersion(goal.id, activeMonth, draftTasks, draftAssigned);
-    setDirty(false);
+    setShowScopeModal(true);
   };
   const confirmScope = (scope) => {
-    commitCurrentMonthEdit(goal.id, draftTasks, draftAssigned, scope);
+    if (isLive) commitCurrentMonthEdit(goal.id, draftTasks, draftAssigned, scope === "month" ? "current" : "currentAndFuture");
+    else scheduleFutureVersion(goal.id, activeMonth, draftTasks, draftAssigned, scope);
     setShowScopeModal(false);
     setDirty(false);
   };
@@ -3570,17 +3575,17 @@ function AnnualGoalEditorCard({ goal, deptEmployees, getMonthView, commitCurrent
           <div className="bg-white rounded-xl max-w-md w-full p-6" onClick={(e) => e.stopPropagation()}>
             <div className="flex items-center gap-2 mb-2">
               <AlertTriangle size={18} className="text-amber-500" />
-              <p className="font-display font-semibold">Update goal — {monthLabel(cur)}</p>
+              <p className="font-display font-semibold">Update goal — {monthLabel(activeMonth)}</p>
             </div>
-            <p className="text-sm text-slate-500 mb-4">This month is already in progress. Choose how far this change should apply. Staff whose tasks change will be notified.</p>
+            <p className="text-sm text-slate-500 mb-4">{isLive ? "This month is already in progress. " : "This month hasn't started yet. "}Choose how far this change should apply. Staff whose tasks change will be notified.</p>
             <div className="space-y-2">
-              <button onClick={() => confirmScope("current")} className="w-full text-left px-4 py-2.5 rounded-lg border border-slate-200 hover:border-teal-300 hover:bg-teal-50 transition-colors">
-                <p className="text-sm font-medium">Edit current month only</p>
-                <p className="text-xs text-slate-400">Reverts back to the old setup automatically next month</p>
+              <button onClick={() => confirmScope("month")} className="w-full text-left px-4 py-2.5 rounded-lg border border-slate-200 hover:border-teal-300 hover:bg-teal-50 transition-colors">
+                <p className="text-sm font-medium">{isLive ? "Edit current month only" : `Edit ${monthLabel(activeMonth)} only`}</p>
+                <p className="text-xs text-slate-400">Reverts back to the old setup automatically the month after</p>
               </button>
-              <button onClick={() => confirmScope("currentAndFuture")} className="w-full text-left px-4 py-2.5 rounded-lg border border-slate-200 hover:border-teal-300 hover:bg-teal-50 transition-colors">
-                <p className="text-sm font-medium">Edit current & every future month</p>
-                <p className="text-xs text-slate-400">Applies now and stays this way until changed again</p>
+              <button onClick={() => confirmScope("future")} className="w-full text-left px-4 py-2.5 rounded-lg border border-slate-200 hover:border-teal-300 hover:bg-teal-50 transition-colors">
+                <p className="text-sm font-medium">{isLive ? "Edit current & every future month" : `Edit ${monthLabel(activeMonth)} & every month after`}</p>
+                <p className="text-xs text-slate-400">{isLive ? "Applies now and stays this way until changed again" : "Takes effect from that month and stays this way until changed again"}</p>
               </button>
               <button onClick={() => setShowScopeModal(false)} className="w-full text-center px-4 py-2 rounded-lg text-slate-500 text-sm">Cancel</button>
             </div>
@@ -4097,51 +4102,63 @@ function AdminCheckins({ departments, employees, checkins, activeDeptId, setActi
   );
 }
 
-function AdminRewards({ companies, activeCompanyId, switchCompany, departments, employees, deptById, goals, rewardSchemes, addRewardScheme, updateRewardSchemePeriod, deleteRewardScheme, undeleteRewardScheme, archiveRewardScheme, restoreRewardScheme, toggleRewardActive, toggleRewardEnrollment, updateRewardEmployeeOverride, commitRewardSchemeEdit, goalCompletionForEmployee, getMonthView, notify }) {
+// ---- Rewards: a scheme = one or more departments + a period. Admin ticks who gets a reward each month,
+// keys in the amount manually (base amount is only the starting default, normally 0) and a remark.
+// Every month's amount/remark is kept in reward_payouts, so each person has a full history. ----
+
+// Text/number input that keeps its own draft while typing and only saves on blur / Enter,
+// so each keystroke doesn't fire a database write.
+function CommitInput({ value, onCommit, type = "text", className = "", placeholder = "", disabled = false }) {
+  const [draft, setDraft] = useState(String(value ?? ""));
+  useEffect(() => { setDraft(String(value ?? "")); }, [value]);
+  const commit = () => { if (draft !== String(value ?? "")) onCommit(type === "number" ? Number(draft || 0) : draft); };
+  return (
+    <input
+      type={type} value={draft} placeholder={placeholder} disabled={disabled}
+      onChange={(e) => setDraft(e.target.value)} onBlur={commit}
+      onKeyDown={(e) => { if (e.key === "Enter") e.target.blur(); }}
+      className={className}
+    />
+  );
+}
+
+const schemeDeptNames = (scheme, deptById) => (scheme.deptIds || []).map((id) => deptById[id]?.name).filter(Boolean).join(", ");
+const schemeTitle = (scheme, deptById, goals) => scheme.name || goals.find((g) => g.id === scheme.goalId)?.name || schemeDeptNames(scheme, deptById) || "Reward scheme";
+
+function AdminRewards({ companies, activeCompanyId, switchCompany, departments, employees, deptById, goals, rewardSchemes, addRewardScheme, updateRewardSchemePeriod, updateRewardSchemeDepts, updateRewardSchemeName, deleteRewardScheme, undeleteRewardScheme, toggleRewardActive, setRewardPayout, commitRewardSchemeEdit, goalCompletionForEmployee, getMonthView, notify }) {
   const deptsInCompany = departments.filter((d) => d.active !== false && d.companyId === activeCompanyId);
-  const [filterDeptId, setFilterDeptId] = useState(deptsInCompany[0]?.id);
-  const [empSearch, setEmpSearch] = useState("");
   const [showNew, setShowNew] = useState(false);
   const [selectedSchemeId, setSelectedSchemeId] = useState(null);
   const [viewMonth, setViewMonth] = useState(currentIsoMonth());
-
-  useEffect(() => {
-    if (!deptsInCompany.some((d) => d.id === filterDeptId)) setFilterDeptId(deptsInCompany[0]?.id);
-  }, [activeCompanyId]);
-
   const [showDeleted, setShowDeleted] = useState(false);
   const [confirmDeleteId, setConfirmDeleteId] = useState(null);
-  const deptSchemes = rewardSchemes.filter((s) => s.deptId === filterDeptId && !!s.deleted === showDeleted && (showDeleted || monthsInRange(s.startDate, s.endDate).includes(viewMonth)));
-  const deletedCount = rewardSchemes.filter((s) => s.deptId === filterDeptId && s.deleted).length;
+
+  const inCompany = rewardSchemes.filter((s) => s.companyId === activeCompanyId);
+  const deptSchemes = inCompany.filter((s) => !!s.deleted === showDeleted && (showDeleted || monthsInRange(s.startDate, s.endDate).includes(viewMonth)));
+  const deletedCount = inCompany.filter((s) => s.deleted).length;
   const selectedScheme = rewardSchemes.find((s) => s.id === selectedSchemeId);
 
   if (selectedScheme) {
     return (
       <RewardSchemeDetail
-        scheme={selectedScheme} dept={deptById[selectedScheme.deptId]} employees={employees.filter((e) => e.deptId === selectedScheme.deptId)}
-        goals={goals} toggleRewardActive={toggleRewardActive} toggleRewardEnrollment={toggleRewardEnrollment}
-        updateRewardEmployeeOverride={updateRewardEmployeeOverride} commitRewardSchemeEdit={commitRewardSchemeEdit}
-        updateRewardSchemePeriod={updateRewardSchemePeriod} deleteRewardScheme={deleteRewardScheme} onDeleted={() => setSelectedSchemeId(null)}
+        scheme={selectedScheme} deptById={deptById} deptsInCompany={deptsInCompany}
+        employees={employees.filter((e) => e.active !== false && e.role !== "ceo" && (selectedScheme.deptIds || []).includes(e.deptId))}
+        goals={goals} toggleRewardActive={toggleRewardActive} setRewardPayout={setRewardPayout} commitRewardSchemeEdit={commitRewardSchemeEdit}
+        updateRewardSchemePeriod={updateRewardSchemePeriod} updateRewardSchemeDepts={updateRewardSchemeDepts} updateRewardSchemeName={updateRewardSchemeName}
+        deleteRewardScheme={deleteRewardScheme} onDeleted={() => setSelectedSchemeId(null)}
         goalCompletionForEmployee={goalCompletionForEmployee} getMonthView={getMonthView} notify={notify}
-        initialMonth={viewMonth}
-        onBack={() => setSelectedSchemeId(null)}
+        initialMonth={viewMonth} onBack={() => setSelectedSchemeId(null)}
       />
     );
   }
 
   return (
     <div>
-      <SectionTitle sub="Rewards are pre-set like goals — pick a department, set the period and tied goal once, and the payout tracks automatically from there.">Reward settings</SectionTitle>
+      <SectionTitle sub="Pick the departments and the period, then tick who receives a reward and key in the amount yourself. Remarks, deadline and history are kept for every person.">Reward settings</SectionTitle>
       <CompanyTabs companies={companies} activeCompanyId={activeCompanyId} switchCompany={switchCompany} />
 
       <div className="bg-white rounded-xl border border-slate-200 p-5 mb-5">
-        <div className="grid grid-cols-2 gap-2 mb-3">
-          <select value={filterDeptId} onChange={(e) => { setFilterDeptId(e.target.value); setEmpSearch(""); }} className="px-3 py-2 rounded-lg border border-slate-200 text-sm">
-            {deptsInCompany.map((d) => <option key={d.id} value={d.id}>{d.name}</option>)}
-          </select>
-          <input value={empSearch} onChange={(e) => setEmpSearch(e.target.value)} placeholder="Search employee…" className="px-3 py-2 rounded-lg border border-slate-200 text-sm" />
-        </div>
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 flex-wrap">
           <button onClick={() => setShowNew((s) => !s)} className="flex items-center gap-1.5 px-4 py-2 rounded-lg bg-slate-900 text-white text-sm font-medium">
             <Gift size={15} />New reward scheme
           </button>
@@ -4157,43 +4174,39 @@ function AdminRewards({ companies, activeCompanyId, switchCompany, departments, 
 
       {showNew && (
         <NewRewardSchemeForm
-          deptId={filterDeptId} companyId={deptById[filterDeptId]?.companyId} goals={goals.filter((g) => g.deptId === filterDeptId)}
+          deptsInCompany={deptsInCompany} companyId={activeCompanyId} defaultDeptId={null}
           addRewardScheme={addRewardScheme} notify={notify} onDone={() => setShowNew(false)}
         />
       )}
 
-      <p className="text-xs uppercase tracking-wide text-slate-400 font-medium mb-2 px-1">{deptById[filterDeptId]?.name} — reward schemes for {monthLabel(viewMonth)}</p>
+      <p className="text-xs uppercase tracking-wide text-slate-400 font-medium mb-2 px-1">{showDeleted ? "Deleted reward schemes" : `Reward schemes for ${monthLabel(viewMonth)}`}</p>
       <div className="space-y-2">
-        {deptSchemes.length === 0 && <p className="text-sm text-slate-400 px-1">No reward schemes cover {monthLabel(viewMonth)} for this department.</p>}
-        {deptSchemes.map((s) => {
-          const goal = goals.find((g) => g.id === s.goalId);
-          return (
-            <div key={s.id} className="w-full bg-white rounded-lg border border-slate-200 p-3.5 flex items-center justify-between gap-3 hover:border-teal-300 transition-colors">
-              <button onClick={() => !s.deleted && setSelectedSchemeId(s.id)} className="flex-1 text-left">
-                <div className="flex items-center gap-2 mb-0.5">
-                  <span className={`text-[10px] font-semibold px-2 py-0.5 rounded-full ${s.active ? "bg-emerald-50 text-emerald-600" : "bg-slate-100 text-slate-400"}`}>{s.deleted ? "Deleted" : s.active ? "Active" : "Inactive"}</span>
-                  <span className="text-sm font-medium text-slate-700">{goal?.name || "Reward scheme"}</span>
-                </div>
-                <p className="text-xs text-slate-400">{fmtDMY(s.startDate)} – {fmtDMY(s.endDate)} · {s.enrolledEmployeeIds.length} enrolled</p>
-              </button>
-              <span className="font-mono text-sm font-semibold text-slate-700">${s.baseAmount}</span>
-              {s.deleted ? (
-                <button onClick={() => { undeleteRewardScheme(s.id); notify("Reward scheme restored"); }} className="text-xs font-medium text-teal-700 hover:underline">Restore</button>
-              ) : confirmDeleteId === s.id ? (
-                <div className="flex items-center gap-1.5">
-                  <span className="text-xs text-slate-500">Delete?</span>
-                  <button onClick={() => { deleteRewardScheme(s.id); setConfirmDeleteId(null); notify("Reward scheme deleted"); }} className="px-2 py-1 rounded-md bg-rose-500 text-white text-xs font-medium">Yes</button>
-                  <button onClick={() => setConfirmDeleteId(null)} className="px-2 py-1 rounded-md border border-slate-200 text-slate-500 text-xs">No</button>
-                </div>
-              ) : (
-                <div className="flex items-center gap-1">
-                  <button onClick={() => setSelectedSchemeId(s.id)} title="Edit" className="p-1.5 rounded-md text-slate-400 hover:bg-teal-50 hover:text-teal-600"><Pencil size={14} /></button>
-                  <button onClick={() => setConfirmDeleteId(s.id)} title="Delete" className="p-1.5 rounded-md text-slate-300 hover:bg-rose-50 hover:text-rose-500"><Trash2 size={14} /></button>
-                </div>
-              )}
-            </div>
-          );
-        })}
+        {deptSchemes.length === 0 && <p className="text-sm text-slate-400 px-1">{showDeleted ? "No deleted schemes." : `No reward schemes cover ${monthLabel(viewMonth)}.`}</p>}
+        {deptSchemes.map((s) => (
+          <div key={s.id} className="w-full bg-white rounded-lg border border-slate-200 p-3.5 flex items-center justify-between gap-3 hover:border-teal-300 transition-colors">
+            <button onClick={() => !s.deleted && setSelectedSchemeId(s.id)} className="flex-1 text-left">
+              <div className="flex items-center gap-2 mb-0.5">
+                <span className={`text-[10px] font-semibold px-2 py-0.5 rounded-full ${s.active && !s.deleted ? "bg-emerald-50 text-emerald-600" : "bg-slate-100 text-slate-400"}`}>{s.deleted ? "Deleted" : s.active ? "Active" : "Inactive"}</span>
+                <span className="text-sm font-medium text-slate-700">{schemeTitle(s, deptById, goals)}</span>
+              </div>
+              <p className="text-xs text-slate-400">{schemeDeptNames(s, deptById) || "—"} · {fmtDMY(s.startDate)} – {fmtDMY(s.endDate)} · {s.payouts.filter((p) => p.eligible && p.month === viewMonth).length} rewarded in {monthShortLabel(viewMonth)}</p>
+            </button>
+            {s.deleted ? (
+              <button onClick={() => { undeleteRewardScheme(s.id); notify("Reward scheme restored"); }} className="text-xs font-medium text-teal-700 hover:underline">Restore</button>
+            ) : confirmDeleteId === s.id ? (
+              <div className="flex items-center gap-1.5">
+                <span className="text-xs text-slate-500">Delete?</span>
+                <button onClick={() => { deleteRewardScheme(s.id); setConfirmDeleteId(null); notify("Reward scheme deleted"); }} className="px-2 py-1 rounded-md bg-rose-500 text-white text-xs font-medium">Yes</button>
+                <button onClick={() => setConfirmDeleteId(null)} className="px-2 py-1 rounded-md border border-slate-200 text-slate-500 text-xs">No</button>
+              </div>
+            ) : (
+              <div className="flex items-center gap-1">
+                <button onClick={() => setSelectedSchemeId(s.id)} title="Edit" className="p-1.5 rounded-md text-slate-400 hover:bg-teal-50 hover:text-teal-600"><Pencil size={14} /></button>
+                <button onClick={() => setConfirmDeleteId(s.id)} title="Delete" className="p-1.5 rounded-md text-slate-300 hover:bg-rose-50 hover:text-rose-500"><Trash2 size={14} /></button>
+              </div>
+            )}
+          </div>
+        ))}
       </div>
       {(deletedCount > 0 || showDeleted) && (
         <button onClick={() => setShowDeleted((v) => !v)} className="mt-3 px-1 text-xs text-slate-400 hover:text-slate-600 hover:underline">
@@ -4204,25 +4217,78 @@ function AdminRewards({ companies, activeCompanyId, switchCompany, departments, 
   );
 }
 
-function NewRewardSchemeForm({ deptId, companyId, goals, addRewardScheme, notify, onDone }) {
-  const [goalId, setGoalId] = useState(goals[0]?.id || "");
-  // Defends against goalId going stale if `goals` wasn't ready at mount (or the department filter
-  // changes underneath this form): keeps it pointed at a real option instead of silently holding an
-  // empty string forever while the <select> visually shows the first option anyway (a browser default
-  // when the current value matches none of the <option>s — masking the fact that Create scheme was
-  // quietly doing nothing).
+function DeptPicker({ deptsInCompany, selectedIds, onChange }) {
+  const scrollRef = useRef(null);
+  const [canScrollLeft, setCanScrollLeft] = useState(false);
+  const [canScrollRight, setCanScrollRight] = useState(false);
+  const toggle = (id) => onChange((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]));
+  const allSelected = deptsInCompany.length > 0 && deptsInCompany.every((d) => selectedIds.includes(d.id));
+  const someSelected = deptsInCompany.some((d) => selectedIds.includes(d.id));
+
+  // One horizontal row that scrolls sideways (swipe, trackpad, or the arrow buttons) when the departments don't all fit.
+  const updateArrows = () => {
+    const el = scrollRef.current;
+    if (!el) return;
+    setCanScrollLeft(el.scrollLeft > 2);
+    setCanScrollRight(el.scrollLeft + el.clientWidth < el.scrollWidth - 2);
+  };
   useEffect(() => {
-    if (!goals.some((g) => g.id === goalId)) setGoalId(goals[0]?.id || "");
-  }, [goals]);
+    updateArrows();
+    window.addEventListener("resize", updateArrows);
+    return () => window.removeEventListener("resize", updateArrows);
+  }, [deptsInCompany.length]);
+  const scrollByDir = (dir) => scrollRef.current && scrollRef.current.scrollBy({ left: dir * Math.max(160, scrollRef.current.clientWidth * 0.7), behavior: "smooth" });
+
+  return (
+    <div>
+      <style>{`.dept-scroll::-webkit-scrollbar{display:none}`}</style>
+      <label className="text-[11px] text-slate-400 block mb-1">Departments (tick one or more)</label>
+      <div className="flex items-center gap-1">
+        {canScrollLeft && (
+          <button type="button" aria-label="Scroll departments left" onClick={() => scrollByDir(-1)} className="shrink-0 w-7 h-7 rounded-full border border-slate-200 bg-white text-slate-500 hover:border-teal-300 hover:text-teal-700 flex items-center justify-center">‹</button>
+        )}
+        <div ref={scrollRef} onScroll={updateArrows} className="dept-scroll flex-1 flex gap-1.5 overflow-x-auto py-0.5" style={{ scrollbarWidth: "none", WebkitOverflowScrolling: "touch" }}>
+          {deptsInCompany.map((d) => {
+            const on = selectedIds.includes(d.id);
+            return (
+              <button type="button" key={d.id} onClick={() => toggle(d.id)} className={`shrink-0 whitespace-nowrap px-3 py-1.5 rounded-full text-xs font-medium border transition-colors ${on ? "bg-teal-600 text-white border-teal-600" : "bg-white text-slate-600 border-slate-200 hover:border-teal-300"}`}>
+                {on ? "✓ " : ""}{d.name}
+              </button>
+            );
+          })}
+        </div>
+        {canScrollRight && (
+          <button type="button" aria-label="Scroll departments right" onClick={() => scrollByDir(1)} className="shrink-0 w-7 h-7 rounded-full border border-slate-200 bg-white text-slate-500 hover:border-teal-300 hover:text-teal-700 flex items-center justify-center">›</button>
+        )}
+      </div>
+      <label className="inline-flex items-center gap-2 mt-2 text-xs text-slate-600 cursor-pointer select-none">
+        <input
+          type="checkbox" checked={allSelected}
+          ref={(el) => { if (el) el.indeterminate = someSelected && !allSelected; }}
+          onChange={() => onChange(() => (allSelected ? [] : deptsInCompany.map((d) => d.id)))}
+          className="accent-teal-600"
+        />
+        Select all departments{someSelected ? ` (${selectedIds.filter((id) => deptsInCompany.some((d) => d.id === id)).length} of ${deptsInCompany.length} selected)` : ""}
+      </label>
+    </div>
+  );
+}
+
+function NewRewardSchemeForm({ deptsInCompany, companyId, defaultDeptId, addRewardScheme, notify, onDone }) {
+  const [name, setName] = useState("");
+  const [deptIds, setDeptIds] = useState(defaultDeptId ? [defaultDeptId] : []);
   const now = new Date();
-  const [startDate, setStartDate] = useState(isoDate(new Date(now.getFullYear(), 0, 1)));
+  const [startDate, setStartDate] = useState(isoDate(new Date(now.getFullYear(), now.getMonth(), 1)));
   const [endDate, setEndDate] = useState(isoDate(new Date(now.getFullYear(), 11, 31)));
-  const [baseAmount, setBaseAmount] = useState(500);
+  const [baseAmount, setBaseAmount] = useState(0);
 
   const applyPreset = (preset) => {
     if (preset === "calendar") {
       setStartDate(isoDate(new Date(now.getFullYear(), 0, 1)));
       setEndDate(isoDate(new Date(now.getFullYear(), 11, 31)));
+    } else if (preset === "month") {
+      setStartDate(isoDate(new Date(now.getFullYear(), now.getMonth(), 1)));
+      setEndDate(isoDate(new Date(now.getFullYear(), now.getMonth() + 1, 0)));
     } else if (typeof preset === "number") {
       let startYear = now.getFullYear();
       if (now.getMonth() < preset) startYear -= 1;
@@ -4230,10 +4296,12 @@ function NewRewardSchemeForm({ deptId, companyId, goals, addRewardScheme, notify
       setEndDate(isoDate(new Date(startYear + 1, preset, 0)));
     }
   };
+  const periodInvalid = !startDate || !endDate || endDate < startDate;
 
   const submit = () => {
-    if (!goalId) { notify("Pick a goal to reward first."); return; }
-    addRewardScheme(deptId, companyId, goalId, startDate, endDate, baseAmount);
+    if (deptIds.length === 0) { notify("Tick at least one department."); return; }
+    if (periodInvalid) { notify("End date must be on or after the start date."); return; }
+    addRewardScheme(deptIds, companyId, name.trim(), startDate, endDate, baseAmount);
     notify("Reward scheme created");
     onDone();
   };
@@ -4241,14 +4309,14 @@ function NewRewardSchemeForm({ deptId, companyId, goals, addRewardScheme, notify
   return (
     <div className="bg-white rounded-xl border-2 border-dashed border-slate-200 p-5 mb-4">
       <p className="text-sm font-semibold mb-3">New reward scheme</p>
-      <label className="text-[11px] text-slate-400">Goal to reward</label>
-      <select value={goalId} onChange={(e) => setGoalId(e.target.value)} className="w-full px-3 py-2 rounded-lg border border-slate-200 text-sm mb-3">
-        {goals.length === 0 && <option value="">No goals in this department yet</option>}
-        {goals.map((g) => <option key={g.id} value={g.id}>{g.name}</option>)}
-      </select>
+      <label className="text-[11px] text-slate-400">Name (optional)</label>
+      <input value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. Q4 sales bonus" className="w-full px-3 py-2 rounded-lg border border-slate-200 text-sm mb-3" />
+
+      <div className="mb-3"><DeptPicker deptsInCompany={deptsInCompany} selectedIds={deptIds} onChange={setDeptIds} /></div>
 
       <p className="text-[11px] text-slate-400 mb-1">Quick-fill a period (you can still adjust the dates)</p>
       <div className="flex flex-wrap gap-1.5 mb-3">
+        <button onClick={() => applyPreset("month")} className="px-2.5 py-1 rounded-full text-[11px] font-medium bg-slate-100 text-slate-600 hover:bg-slate-200">This month</button>
         <button onClick={() => applyPreset("calendar")} className="px-2.5 py-1 rounded-full text-[11px] font-medium bg-slate-100 text-slate-600 hover:bg-slate-200">This calendar year</button>
         {["Jan", "Apr", "Jul", "Oct"].map((label, idx) => (
           <button key={label} onClick={() => applyPreset([0, 3, 6, 9][idx])} className="px-2.5 py-1 rounded-full text-[11px] font-medium bg-slate-100 text-slate-600 hover:bg-slate-200">Fiscal year from {label}</button>
@@ -4267,6 +4335,7 @@ function NewRewardSchemeForm({ deptId, companyId, goals, addRewardScheme, notify
           <p className="text-[10px] text-slate-400 mt-0.5">{fmtDMY(endDate)}</p>
         </div>
       </div>
+      {periodInvalid && <p className="text-xs text-rose-500 mb-2">End date must be on or after the start date.</p>}
 
       <div className="mb-4">
         <label className="text-[11px] text-slate-400">Base amount ($)</label>
@@ -4274,46 +4343,42 @@ function NewRewardSchemeForm({ deptId, companyId, goals, addRewardScheme, notify
           <span className="text-slate-400">$</span>
           <input type="number" value={baseAmount} onChange={(e) => setBaseAmount(Number(e.target.value))} className="flex-1 outline-none" />
         </div>
-        <p className="text-[11px] text-slate-400 mt-1.5">This is the starting amount for everyone you enroll — you can adjust it per employee afterward to any number.</p>
+        <p className="text-[11px] text-slate-400 mt-1.5">Leave at 0 if you'll work out each reward yourself — you key in the amount for each person after ticking them.</p>
       </div>
 
       <div className="flex gap-2">
-        <button onClick={submit} className="px-4 py-2 rounded-lg bg-slate-900 text-white text-sm font-medium">Create scheme</button>
+        <button onClick={submit} disabled={periodInvalid} className="px-4 py-2 rounded-lg bg-slate-900 text-white text-sm font-medium disabled:opacity-40">Create scheme</button>
         <button onClick={onDone} className="px-4 py-2 rounded-lg border border-slate-200 text-slate-600 text-sm font-medium">Cancel</button>
       </div>
     </div>
   );
 }
 
-function RewardSchemeDetail({ scheme, dept, employees, goals, updateRewardSchemePeriod, deleteRewardScheme, onDeleted, toggleRewardActive, toggleRewardEnrollment, updateRewardEmployeeOverride, commitRewardSchemeEdit, goalCompletionForEmployee, getMonthView, notify, initialMonth, onBack }) {
+function RewardSchemeDetail({ scheme, deptById, deptsInCompany, employees, goals, updateRewardSchemePeriod, updateRewardSchemeDepts, updateRewardSchemeName, deleteRewardScheme, onDeleted, toggleRewardActive, setRewardPayout, commitRewardSchemeEdit, goalCompletionForEmployee, getMonthView, notify, initialMonth, onBack }) {
   const goal = goals.find((g) => g.id === scheme.goalId);
-  const [editing, setEditing] = useState(false);
+  const [panel, setPanel] = useState(null); // "amount" | "period" | "depts" | "name"
   const [draftAmount, setDraftAmount] = useState(scheme.baseAmount);
-  const [showScopeModal, setShowScopeModal] = useState(false);
-  const [editingPeriod, setEditingPeriod] = useState(false);
+  const [draftName, setDraftName] = useState(scheme.name || "");
+  const [draftDepts, setDraftDepts] = useState(scheme.deptIds || []);
   const [draftStart, setDraftStart] = useState(scheme.startDate);
   const [draftEnd, setDraftEnd] = useState(scheme.endDate);
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const [search, setSearch] = useState("");
+  const [historyEmpId, setHistoryEmpId] = useState(null);
   const periodInvalid = !draftStart || !draftEnd || draftEnd < draftStart;
-  const savePeriod = () => {
-    if (periodInvalid) return;
-    updateRewardSchemePeriod(scheme.id, draftStart, draftEnd);
-    setEditingPeriod(false);
-    notify("Reward period updated");
-  };
 
   const cur = currentIsoMonth();
   const schemeMonths = monthsInRange(scheme.startDate, scheme.endDate);
   const preferredStart = (initialMonth && schemeMonths.includes(initialMonth)) ? initialMonth : (schemeMonths.includes(cur) ? cur : (schemeMonths[schemeMonths.length - 1] || cur));
   const [selectedMonth, setSelectedMonth] = useState(preferredStart);
-  const isPastMonth = selectedMonth < cur;
-  const isFutureMonth = selectedMonth > cur;
-  const deadline = endOfMonth(selectedMonth);
+  useEffect(() => { if (!schemeMonths.includes(selectedMonth)) setSelectedMonth(schemeMonths.includes(cur) ? cur : (schemeMonths[0] || cur)); }, [scheme.startDate, scheme.endDate]);
+  // Deadline for this month's reward = end of that month, never later than the scheme's own end date.
+  const monthEnd = endOfMonth(selectedMonth);
+  const deadline = monthEnd > scheme.endDate ? scheme.endDate : monthEnd;
 
-  // Completion% for a past month reads the goal's own frozen history (accurate). For the live month it
-  // reads current progress. Shown for reference only — the reward amount itself is set freely per employee.
-  const completionInSelectedMonth = (empId) => {
-    if (!goal) return 0;
+  const payoutFor = (empId, month) => scheme.payouts.find((p) => p.employeeId === empId && p.month === month);
+  const completionInMonth = (empId) => {
+    if (!goal) return null;
     if (!goal.isAnnual) return goalCompletionForEmployee(goal, empId);
     const view = getMonthView(goal, selectedMonth);
     if (view.status === "live") return goalCompletionForEmployee(goal, empId);
@@ -4326,15 +4391,15 @@ function RewardSchemeDetail({ scheme, dept, employees, goals, updateRewardScheme
       });
       return capacity > 0 ? Math.round((awardedSum / capacity) * 1000) / 10 : 0;
     }
-    return 0; // scheduled/future month — nothing to show yet
+    return 0;
   };
 
-  const saveEdit = () => setShowScopeModal(true);
-  const confirmScope = (scope) => {
-    commitRewardSchemeEdit(scheme.id, draftAmount, scope);
-    setShowScopeModal(false);
-    setEditing(false);
-  };
+  const rows = employees
+    .filter((e) => e.name.toLowerCase().includes(search.toLowerCase()))
+    .sort((a, b) => (deptById[a.deptId]?.name || "").localeCompare(deptById[b.deptId]?.name || "") || a.name.localeCompare(b.name));
+  const monthTotal = scheme.payouts.filter((p) => p.month === selectedMonth && p.eligible && employees.some((e) => e.id === p.employeeId)).reduce((a, p) => a + p.amount, 0);
+  const historyEmp = employees.find((e) => e.id === historyEmpId);
+  const historyRows = historyEmpId ? scheme.payouts.filter((p) => p.employeeId === historyEmpId).sort((a, b) => (a.month < b.month ? 1 : -1)) : [];
 
   return (
     <div>
@@ -4343,115 +4408,136 @@ function RewardSchemeDetail({ scheme, dept, employees, goals, updateRewardScheme
       </button>
 
       <div className="bg-white rounded-xl border border-slate-200 p-5 mb-4">
-        <div className="flex items-center justify-between mb-2">
+        <div className="flex items-center justify-between mb-2 gap-3">
           <div>
-            <p className="font-display font-semibold text-sm">{dept?.name} — {goal?.name || "Reward scheme"}</p>
-            <p className="text-xs text-slate-400">{fmtDMY(scheme.startDate)} – {fmtDMY(scheme.endDate)} · Deadline this period: {fmtDMY(deadline)}</p>
+            <p className="font-display font-semibold text-sm">{schemeTitle(scheme, deptById, goals)}</p>
+            <p className="text-xs text-slate-400">{schemeDeptNames(scheme, deptById)} · {fmtDMY(scheme.startDate)} – {fmtDMY(scheme.endDate)}</p>
           </div>
-          <button onClick={() => { toggleRewardActive(scheme.id); notify(scheme.active ? "Scheme turned off" : "Scheme turned on"); }} className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-semibold ${scheme.active ? "bg-emerald-50 text-emerald-600" : "bg-slate-100 text-slate-400"}`}>
+          <button onClick={() => { toggleRewardActive(scheme.id); notify(scheme.active ? "Scheme turned off" : "Scheme turned on"); }} className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-semibold ${scheme.active ? "bg-emerald-50 text-emerald-700" : "bg-slate-100 text-slate-500"}`}>
             <div className={`w-7 h-4 rounded-full relative transition-colors ${scheme.active ? "bg-emerald-500" : "bg-slate-300"}`}>
               <div className={`absolute top-0.5 w-3 h-3 rounded-full bg-white transition-all ${scheme.active ? "left-3.5" : "left-0.5"}`} />
             </div>
             {scheme.active ? "Active" : "Inactive"}
           </button>
         </div>
+        <div className="flex items-center gap-4 flex-wrap">
+          <button onClick={() => { setPanel(panel === "name" ? null : "name"); setDraftName(scheme.name || ""); }} className="text-xs font-medium text-teal-700 hover:underline">Rename</button>
+          <button onClick={() => { setPanel(panel === "depts" ? null : "depts"); setDraftDepts(scheme.deptIds || []); }} className="text-xs font-medium text-teal-700 hover:underline">Edit departments</button>
+          <button onClick={() => { setPanel(panel === "period" ? null : "period"); setDraftStart(scheme.startDate); setDraftEnd(scheme.endDate); }} className="text-xs font-medium text-teal-700 hover:underline">Edit period</button>
+          <button onClick={() => { setPanel(panel === "amount" ? null : "amount"); setDraftAmount(scheme.baseAmount); }} className="text-xs font-medium text-teal-700 hover:underline">Edit base amount (${scheme.baseAmount})</button>
+          {!confirmDelete ? (
+            <button onClick={() => setConfirmDelete(true)} className="text-xs font-medium text-rose-500 hover:underline">Delete scheme</button>
+          ) : (
+            <span className="flex items-center gap-1.5 text-xs">
+              <span className="text-slate-500">Delete this scheme?</span>
+              <button onClick={() => { deleteRewardScheme(scheme.id); notify("Reward scheme deleted"); onDeleted(); }} className="px-2 py-1 rounded-md bg-rose-500 text-white font-medium">Yes, delete</button>
+              <button onClick={() => setConfirmDelete(false)} className="px-2 py-1 rounded-md border border-slate-200 text-slate-500">Cancel</button>
+            </span>
+          )}
+        </div>
 
-        {!editing ? (
-          <div className="flex items-center gap-4 flex-wrap">
-            <button onClick={() => { setEditing(true); setDraftAmount(scheme.baseAmount); }} className="text-xs font-medium text-teal-700 hover:underline">Edit base amount</button>
-            <button onClick={() => { setEditingPeriod((v) => !v); setDraftStart(scheme.startDate); setDraftEnd(scheme.endDate); }} className="text-xs font-medium text-teal-700 hover:underline">Edit period</button>
-            {!confirmDelete ? (
-              <button onClick={() => setConfirmDelete(true)} className="text-xs font-medium text-rose-500 hover:underline">Delete scheme</button>
-            ) : (
-              <span className="flex items-center gap-1.5 text-xs">
-                <span className="text-slate-500">Delete this scheme?</span>
-                <button onClick={() => { deleteRewardScheme(scheme.id); notify("Reward scheme deleted"); onDeleted(); }} className="px-2 py-1 rounded-md bg-rose-500 text-white font-medium">Yes, delete</button>
-                <button onClick={() => setConfirmDelete(false)} className="px-2 py-1 rounded-md border border-slate-200 text-slate-500">Cancel</button>
-              </span>
-            )}
+        {panel === "name" && (
+          <div className="flex items-end gap-2 mt-3">
+            <div className="flex-1 max-w-sm"><label className="text-[11px] text-slate-400">Scheme name</label>
+              <input value={draftName} onChange={(e) => setDraftName(e.target.value)} className="w-full px-3 py-2 rounded-lg border border-slate-200 text-sm" /></div>
+            <button onClick={() => { updateRewardSchemeName(scheme.id, draftName.trim()); setPanel(null); notify("Name updated"); }} className="px-3 py-2 rounded-lg bg-slate-900 text-white text-xs font-medium">Save</button>
+            <button onClick={() => setPanel(null)} className="px-3 py-2 rounded-lg border border-slate-200 text-slate-600 text-xs font-medium">Cancel</button>
           </div>
-        ) : (
-          <div className="flex items-end gap-2 mt-2">
-            <div>
-              <label className="text-[11px] text-slate-400">Base amount</label>
-              <input type="number" value={draftAmount} onChange={(e) => setDraftAmount(Number(e.target.value))} className="w-24 px-2 py-1.5 rounded-md border border-slate-200 text-sm" />
+        )}
+        {panel === "depts" && (
+          <div className="mt-3">
+            <DeptPicker deptsInCompany={deptsInCompany} selectedIds={draftDepts} onChange={setDraftDepts} />
+            <p className="text-[11px] text-slate-400 mt-1.5">Removing a department hides its people from the table; their saved rewards and history stay.</p>
+            <div className="flex gap-2 mt-2">
+              <button onClick={() => { if (draftDepts.length === 0) { notify("Tick at least one department."); return; } updateRewardSchemeDepts(scheme.id, draftDepts); setPanel(null); notify("Departments updated"); }} className="px-3 py-1.5 rounded-lg bg-slate-900 text-white text-xs font-medium">Save departments</button>
+              <button onClick={() => setPanel(null)} className="px-3 py-1.5 rounded-lg border border-slate-200 text-slate-600 text-xs font-medium">Cancel</button>
             </div>
-            <button onClick={saveEdit} className="px-3 py-1.5 rounded-lg bg-slate-900 text-white text-xs font-medium">Save</button>
-            <button onClick={() => setEditing(false)} className="px-3 py-1.5 rounded-lg border border-slate-200 text-slate-600 text-xs font-medium">Cancel</button>
+          </div>
+        )}
+        {panel === "period" && (
+          <div className="mt-3">
+            <div className="grid grid-cols-2 gap-2 max-w-md mb-2">
+              <div>
+                <label className="text-[11px] text-slate-400">Start date</label>
+                <input type="date" value={draftStart} onChange={(e) => setDraftStart(e.target.value)} className="w-full px-3 py-2 rounded-lg border border-slate-200 text-sm" />
+                <p className="text-[10px] text-slate-400 mt-0.5">{fmtDMY(draftStart)}</p>
+              </div>
+              <div>
+                <label className="text-[11px] text-slate-400">End date</label>
+                <input type="date" value={draftEnd} onChange={(e) => setDraftEnd(e.target.value)} className="w-full px-3 py-2 rounded-lg border border-slate-200 text-sm" />
+                <p className="text-[10px] text-slate-400 mt-0.5">{fmtDMY(draftEnd)}</p>
+              </div>
+            </div>
+            {periodInvalid && <p className="text-xs text-rose-500 mb-2">End date must be on or after the start date.</p>}
+            <div className="flex gap-2">
+              <button onClick={() => { if (periodInvalid) return; updateRewardSchemePeriod(scheme.id, draftStart, draftEnd); setPanel(null); notify("Reward period updated"); }} disabled={periodInvalid} className="px-3 py-1.5 rounded-lg bg-slate-900 text-white text-xs font-medium disabled:opacity-40">Save period</button>
+              <button onClick={() => setPanel(null)} className="px-3 py-1.5 rounded-lg border border-slate-200 text-slate-600 text-xs font-medium">Cancel</button>
+            </div>
+          </div>
+        )}
+        {panel === "amount" && (
+          <div className="flex items-end gap-2 mt-3">
+            <div>
+              <label className="text-[11px] text-slate-400">Base amount (starting amount when you tick someone)</label>
+              <input type="number" value={draftAmount} onChange={(e) => setDraftAmount(Number(e.target.value))} className="w-28 px-2 py-1.5 rounded-md border border-slate-200 text-sm block" />
+            </div>
+            <button onClick={() => { commitRewardSchemeEdit(scheme.id, draftAmount, "currentAndFuture"); setPanel(null); }} className="px-3 py-1.5 rounded-lg bg-slate-900 text-white text-xs font-medium">Save</button>
+            <button onClick={() => setPanel(null)} className="px-3 py-1.5 rounded-lg border border-slate-200 text-slate-600 text-xs font-medium">Cancel</button>
           </div>
         )}
       </div>
 
-      {editingPeriod && (
-        <div className="bg-white rounded-xl border border-slate-200 p-4 mb-4">
-          <p className="text-sm font-semibold mb-2">Edit period</p>
-          <div className="grid grid-cols-2 gap-2 max-w-md mb-2">
-            <div>
-              <label className="text-[11px] text-slate-400">Start date</label>
-              <input type="date" value={draftStart} onChange={(e) => setDraftStart(e.target.value)} className="w-full px-3 py-2 rounded-lg border border-slate-200 text-sm" />
-              <p className="text-[10px] text-slate-400 mt-0.5">{fmtDMY(draftStart)}</p>
-            </div>
-            <div>
-              <label className="text-[11px] text-slate-400">End date</label>
-              <input type="date" value={draftEnd} onChange={(e) => setDraftEnd(e.target.value)} className="w-full px-3 py-2 rounded-lg border border-slate-200 text-sm" />
-              <p className="text-[10px] text-slate-400 mt-0.5">{fmtDMY(draftEnd)}</p>
-            </div>
-          </div>
-          {periodInvalid && <p className="text-xs text-rose-500 mb-2">End date must be on or after the start date.</p>}
-          <div className="flex gap-2">
-            <button onClick={savePeriod} disabled={periodInvalid} className="px-3 py-1.5 rounded-lg bg-slate-900 text-white text-xs font-medium disabled:opacity-40">Save period</button>
-            <button onClick={() => setEditingPeriod(false)} className="px-3 py-1.5 rounded-lg border border-slate-200 text-slate-600 text-xs font-medium">Cancel</button>
-          </div>
-        </div>
-      )}
-
-      <div className="flex items-center gap-3 mb-3">
+      <div className="flex items-end gap-3 mb-3 flex-wrap">
         <div>
-          <label className="text-[11px] text-slate-400 block mb-0.5">Viewing period</label>
+          <label className="text-[11px] text-slate-400 block mb-0.5">Reward month</label>
           <select value={selectedMonth} onChange={(e) => setSelectedMonth(e.target.value)} className="px-3 py-1.5 rounded-lg border border-slate-200 text-sm">
             {schemeMonths.map((m) => <option key={m} value={m}>{monthLabel(m)}{m === cur ? " (current)" : ""}</option>)}
           </select>
         </div>
-        {isPastMonth && <span className="text-[11px] font-medium text-slate-500 bg-slate-100 px-2.5 py-1 rounded-full mt-4">Viewing a past period — read-only history</span>}
-        {isFutureMonth && <span className="text-[11px] font-medium text-amber-600 bg-amber-50 px-2.5 py-1 rounded-full mt-4">Upcoming period — nothing to show yet</span>}
+        <div>
+          <label className="text-[11px] text-slate-400 block mb-0.5">Search employee</label>
+          <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Name…" className="px-3 py-1.5 rounded-lg border border-slate-200 text-sm" />
+        </div>
+        <p className="text-xs text-slate-500 pb-2">Deadline: <span className="font-medium text-slate-700">{fmtDMY(deadline)}</span> · Total this month: <span className="font-mono font-semibold text-slate-700">${monthTotal}</span></p>
       </div>
 
       <div className="bg-white rounded-xl border border-slate-200 overflow-x-auto">
-        <table className="w-full text-sm" style={{ minWidth: 1100 }}>
+        <table className="w-full text-sm" style={{ minWidth: goal ? 1100 : 950 }}>
           <thead>
             <tr className="border-b border-slate-100 bg-slate-50/60 text-left text-slate-500">
               <th className="px-3 py-2.5 font-medium"></th>
-              <th className="px-3 py-2.5 font-medium">Update amount</th>
+              <th className="px-3 py-2.5 font-medium">Reward amount</th>
               <th className="px-3 py-2.5 font-medium">Employee</th>
+              <th className="px-3 py-2.5 font-medium">Department</th>
               <th className="px-3 py-2.5 font-medium">Status</th>
-              <th className="px-3 py-2.5 font-medium">Current mission</th>
+              {goal && <th className="px-3 py-2.5 font-medium">Current mission</th>}
               <th className="px-3 py-2.5 font-medium">Remark</th>
-              <th className="px-3 py-2.5 font-medium">Period</th>
               <th className="px-3 py-2.5 font-medium">Deadline</th>
               <th className="px-3 py-2.5 font-medium text-center">History</th>
             </tr>
           </thead>
           <tbody>
-            {employees.map((e) => {
-              const enrolled = scheme.enrolledEmployeeIds.includes(e.id);
-              const override = scheme.employeeOverrides[e.id] || { updateAmount: scheme.baseAmount, remark: "" };
-              const completion = completionInSelectedMonth(e.id);
+            {rows.length === 0 && <tr><td colSpan={9} className="px-3 py-6 text-center text-slate-400 text-sm">No employees in the selected departments.</td></tr>}
+            {rows.map((e) => {
+              const p = payoutFor(e.id, selectedMonth);
+              const eligible = !!p?.eligible;
+              const completion = completionInMonth(e.id);
               return (
                 <tr key={e.id} className="border-b border-slate-50 last:border-0">
-                  <td className="px-3 py-2.5"><input type="checkbox" checked={enrolled} disabled={isPastMonth || isFutureMonth} onChange={() => toggleRewardEnrollment(scheme.id, e.id)} className="accent-teal-600 disabled:opacity-40" /></td>
+                  <td className="px-3 py-2.5"><input type="checkbox" checked={eligible} onChange={() => setRewardPayout(scheme.id, e.id, selectedMonth, { eligible: !eligible })} className="accent-teal-600" /></td>
                   <td className="px-3 py-2.5">
                     <div className="flex items-center gap-1">
                       <span className="text-slate-400">$</span>
-                      <input type="number" value={override.updateAmount} disabled={isPastMonth || isFutureMonth} onChange={(ev) => updateRewardEmployeeOverride(scheme.id, e.id, { updateAmount: Number(ev.target.value) })} className="w-20 px-1.5 py-1 rounded-md border border-slate-200 text-xs disabled:opacity-40 disabled:bg-slate-50" />
+                      <CommitInput type="number" value={p ? p.amount : scheme.baseAmount} disabled={!eligible} onCommit={(v) => setRewardPayout(scheme.id, e.id, selectedMonth, { amount: v })} className="w-24 px-1.5 py-1 rounded border border-slate-200 text-sm font-mono disabled:bg-slate-50 disabled:text-slate-300" />
                     </div>
                   </td>
                   <td className="px-3 py-2.5 font-medium text-slate-700 whitespace-nowrap">{e.name}</td>
-                  <td className="px-3 py-2.5"><span className={`text-[10px] font-semibold px-2 py-0.5 rounded-full ${enrolled ? "bg-emerald-50 text-emerald-600" : "bg-slate-100 text-slate-400"}`}>{enrolled ? "Eligible" : "Not enrolled"}</span></td>
-                  <td className="px-3 py-2.5 text-slate-500 whitespace-nowrap">{goal?.name || "—"} <span className="text-slate-400">({completion}%)</span></td>
-                  <td className="px-3 py-2.5"><input value={override.remark} disabled={isPastMonth || isFutureMonth} onChange={(ev) => updateRewardEmployeeOverride(scheme.id, e.id, { remark: ev.target.value })} placeholder="—" className="w-32 px-1.5 py-1 rounded-md border border-slate-200 text-xs disabled:opacity-40 disabled:bg-slate-50" /></td>
-                  <td className="px-3 py-2.5 text-slate-500 text-xs whitespace-nowrap">Monthly</td>
+                  <td className="px-3 py-2.5 text-slate-500 text-xs whitespace-nowrap">{deptById[e.deptId]?.name || "—"}</td>
+                  <td className="px-3 py-2.5"><span className={`text-[10px] font-semibold px-2 py-0.5 rounded-full ${eligible ? "bg-emerald-50 text-emerald-600" : "bg-slate-100 text-slate-400"}`}>{eligible ? "Rewarded" : "Not selected"}</span></td>
+                  {goal && <td className="px-3 py-2.5 text-slate-500 whitespace-nowrap">{goal.name} <span className="text-slate-400">({completion}%)</span></td>}
+                  <td className="px-3 py-2.5"><CommitInput value={p?.remark || ""} disabled={!eligible} placeholder="—" onCommit={(v) => setRewardPayout(scheme.id, e.id, selectedMonth, { remark: v })} className="w-44 px-1.5 py-1 rounded border border-slate-200 text-xs disabled:bg-slate-50" /></td>
                   <td className="px-3 py-2.5 text-slate-500 text-xs whitespace-nowrap">{fmtDMY(deadline)}</td>
-                  <td className="px-3 py-2.5 text-center"><button title="History" className="text-slate-400 hover:text-slate-600"><CalendarClock size={14} /></button></td>
+                  <td className="px-3 py-2.5 text-center"><button onClick={() => setHistoryEmpId(e.id)} title="History" className="text-slate-400 hover:text-teal-600"><CalendarClock size={14} /></button></td>
                 </tr>
               );
             })}
@@ -4459,25 +4545,28 @@ function RewardSchemeDetail({ scheme, dept, employees, goals, updateRewardScheme
         </table>
       </div>
 
-      {showScopeModal && (
-        <div className="fixed inset-0 bg-slate-900/40 flex items-center justify-center z-30 p-6" onClick={() => setShowScopeModal(false)}>
-          <div className="bg-white rounded-xl max-w-md w-full p-6" onClick={(e) => e.stopPropagation()}>
-            <div className="flex items-center gap-2 mb-2">
-              <AlertTriangle size={18} className="text-amber-500" />
-              <p className="font-display font-semibold">Update reward scheme</p>
-            </div>
-            <p className="text-sm text-slate-500 mb-4">Choose how far this change should apply.</p>
-            <div className="space-y-2">
-              <button onClick={() => confirmScope("current")} className="w-full text-left px-4 py-2.5 rounded-lg border border-slate-200 hover:border-teal-300 hover:bg-teal-50 transition-colors">
-                <p className="text-sm font-medium">This month only</p>
-                <p className="text-xs text-slate-400">Reverts back to the old setup automatically next month</p>
-              </button>
-              <button onClick={() => confirmScope("currentAndFuture")} className="w-full text-left px-4 py-2.5 rounded-lg border border-slate-200 hover:border-teal-300 hover:bg-teal-50 transition-colors">
-                <p className="text-sm font-medium">This month & every future month</p>
-                <p className="text-xs text-slate-400">Applies now and stays this way until changed again</p>
-              </button>
-              <button onClick={() => setShowScopeModal(false)} className="w-full text-center px-4 py-2 rounded-lg text-slate-500 text-sm">Cancel</button>
-            </div>
+      {historyEmp && (
+        <div className="fixed inset-0 bg-slate-900/40 flex items-center justify-center z-30 p-6" onClick={() => setHistoryEmpId(null)}>
+          <div className="bg-white rounded-xl max-w-lg w-full p-6 max-h-[80vh] overflow-y-auto" onClick={(ev) => ev.stopPropagation()}>
+            <p className="font-display font-semibold mb-0.5">{historyEmp.name} — reward history</p>
+            <p className="text-xs text-slate-400 mb-3">{schemeTitle(scheme, deptById, goals)} · {deptById[historyEmp.deptId]?.name}</p>
+            {historyRows.length === 0 ? <p className="text-sm text-slate-400 mb-3">No rewards recorded yet.</p> : (
+              <table className="w-full text-sm mb-3">
+                <thead><tr className="text-left text-slate-400 text-xs border-b border-slate-100"><th className="py-1.5 font-medium">Month</th><th className="py-1.5 font-medium">Amount</th><th className="py-1.5 font-medium">Remark</th><th className="py-1.5 font-medium">Last updated</th></tr></thead>
+                <tbody>
+                  {historyRows.map((h) => (
+                    <tr key={h.month} className="border-b border-slate-50 last:border-0">
+                      <td className="py-1.5">{monthLabel(h.month)}</td>
+                      <td className="py-1.5 font-mono">{h.eligible ? `$${h.amount}` : <span className="text-slate-400 font-sans text-xs">not selected</span>}</td>
+                      <td className="py-1.5 text-slate-500 text-xs">{h.remark || "—"}</td>
+                      <td className="py-1.5 text-slate-400 text-xs">{h.updatedAt ? fmtDMY(h.updatedAt.slice(0, 10)) : "—"}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+            <p className="text-xs text-slate-500 mb-3">Total rewarded: <span className="font-mono font-semibold text-slate-700">${historyRows.filter((h) => h.eligible).reduce((a, h) => a + h.amount, 0)}</span></p>
+            <button onClick={() => setHistoryEmpId(null)} className="px-4 py-2 rounded-lg border border-slate-200 text-slate-600 text-sm font-medium">Close</button>
           </div>
         </div>
       )}
